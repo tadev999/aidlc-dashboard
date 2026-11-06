@@ -1,0 +1,39 @@
+{
+  "name": "aidlc-dashboard",
+  "version": "1.0.0",
+  "description": "Dashboard trực quan hóa và điều khiển hai chiều cho các AI Coding Agents hoạt động theo framework [awslabs/aidlc-workflows](https://github.com/awslabs/aidlc-workflows).",
+  "main": "server/index.js",
+  "bin": {
+    "aidlc-dashboard": "./bin/aidlc-dashboard.js"
+  },
+  "scripts": {
+    "build": "vite build",
+    "start": "node bin/aidlc-dashboard.js",
+    "dev": "concurrently -k -p \"[{name}]\" -n \"CLIENT,SERVER\" -c \"cyan.bold,green.bold\" \"vite\" \"node server/index.js\"",
+    "dev:client": "vite",
+    "dev:server": "node server/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "chokidar": "^3.6.0",
+    "commander": "^12.1.0",
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "gray-matter": "^4.0.3",
+    "lucide-react": "^1.69.0",
+    "open": "^11.0.4",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "ws": "^8.22.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.6.2",
+    "concurrently": "^10.0.6",
+    "postcss": "^8.5.32",
+    "tailwindcss": "^3.4.17",
+    "vite": "^5.4.11"
+  }
+}
