@@ -77,7 +77,7 @@ class AidlcParser {
 
         const intents = fs.readdirSync(intentsDir, { withFileTypes: true });
         for (const intent of intents) {
-          if (!intent.isDirectory()) continue;
+          if (!intent.isDirectory() || intent.name.startsWith('.')) continue;
           const intentPath = path.join(intentsDir, intent.name);
           const statePath = path.join(intentPath, 'aidlc-state.md');
           results.push({
@@ -147,6 +147,7 @@ class AidlcParser {
 
       // Parse Gate Details
       const gateDetails = this.parseGateDetails(content, data.gate);
+      const stageGraph = this.parseStageGraph(content);
 
       return {
         raw: rawContent,
@@ -158,12 +159,54 @@ class AidlcParser {
         activeIntent: data.intent || path.basename(path.dirname(filePath)),
         unitsOfWork: uows,
         gate: gateDetails,
+        stageGraph,
         updatedAt: fs.statSync(filePath).mtime
       };
     } catch (err) {
       console.error('Error parsing state file:', err);
       return null;
     }
+  }
+
+  /**
+   * Read the effective stage plan emitted by AI-DLC instead of assuming that
+   * every intent uses the same stock list. The workflow can omit stages,
+   * compile custom scopes, or add plugin stages.
+   */
+  parseStageGraph(content) {
+    const phases = [];
+    let current = null;
+    const phasePattern = /^###\s+(?:\[[^\]]+\]\s+)?(.+?)\s+PHASE\s*$/i;
+    const stagePattern = /^-\s*\[([ xX~?RrSs-])\]\s+([a-z0-9][a-z0-9-]*)\s*(?:[—-]\s*(.*?))?(?:\s+—\s+.*)?$/i;
+
+    for (const line of content.split(/\r?\n/)) {
+      const phaseMatch = line.match(phasePattern);
+      if (phaseMatch) {
+        current = {
+          id: phaseMatch[1].trim().toLowerCase().replace(/\s+/g, '-'),
+          name: phaseMatch[1].trim(),
+          description: '',
+          stages: []
+        };
+        phases.push(current);
+        continue;
+      }
+
+      const stageMatch = line.match(stagePattern);
+      if (!stageMatch || !current) continue;
+      const slug = stageMatch[2].toLowerCase();
+      const mark = stageMatch[1].toLowerCase();
+      const label = stageMatch[3]?.trim();
+      current.stages.push({
+        id: slug,
+        name: label && !/^(EXECUTE|SKIP)$/i.test(label) ? label : slug.replace(/-/g, ' '),
+        poName: slug.replace(/-/g, ' '),
+        isGate: mark === '?' || /approval|gate|handoff|review/.test(slug),
+        progress: mark === 'x' ? 'COMPLETED' : mark === '-' || mark === '~' ? 'ACTIVE' : mark === '?' ? 'WAITING_APPROVAL' : mark === 'r' ? 'REVISING' : mark === 's' ? 'SKIPPED' : 'PENDING'
+      });
+    }
+
+    return phases.length > 0 ? phases : null;
   }
 
   parseUnitsOfWork(content, frontmatterUows) {
@@ -236,7 +279,7 @@ class AidlcParser {
 
         for (const line of lines) {
           const trimmed = line.trim();
-          if (!trimmed || trimmed.startsWith('#')) continue;
+          if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('**') || /^-{3,}$/.test(trimmed)) continue;
 
           // Try parsing markdown list items with timestamps
           // e.g. - [2026-11-05T21:55:00Z] [INFO] [Agent] Decision description
@@ -271,8 +314,131 @@ class AidlcParser {
       console.error('Error reading audit logs:', err);
     }
 
+    try {
+      for (const row of this.parseEngineAudit(intentPath)) {
+        const f = row.fields;
+        events.push({
+          timestamp: row.timestamp,
+          level: row.event,
+          actor: f.Approver || f.Agent || (row.event === 'HUMAN_TURN' ? 'Person' : 'AI-DLC'),
+          message: [f.Stage, f.Decision || f.Details || f['User Input'] || f.Feedback || f.Reason]
+            .filter(Boolean).join(' — '),
+          stage: f.Stage || null,
+          detail: f.Decision || f.Details || f['User Input'] || f.Feedback || f.Reason || f.File || null,
+          raw: '',
+          file: row.file
+        });
+      }
+    } catch (err) {
+      console.error('Error reading engine audit:', err);
+    }
+
     // Sort newest first
     return events.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+  }
+
+  /**
+   * Engine audit rows: `## Heading` / `**Field**: value` blocks separated by `---`.
+   */
+  parseEngineAudit(intentPath) {
+    const auditDir = path.join(intentPath, 'audit');
+    if (!fs.existsSync(auditDir)) return [];
+    const rows = [];
+    for (const file of fs.readdirSync(auditDir)) {
+      if (!file.endsWith('.md')) continue;
+      const content = fs.readFileSync(path.join(auditDir, file), 'utf-8');
+      content.split(/\n---\n/).forEach((block, pos) => {
+        const fields = {};
+        for (const line of block.split('\n')) {
+          const m = line.match(/^\*\*([^*]+)\*\*:\s?(.*)$/);
+          if (m && !(m[1] in fields)) fields[m[1]] = m[2].replace(/\\n/g, '\n');
+        }
+        if (fields.Event && fields.Timestamp) {
+          rows.push({ event: fields.Event, timestamp: fields.Timestamp, fields, file, pos });
+        }
+      });
+    }
+    return rows.sort((a, b) => a.timestamp.localeCompare(b.timestamp) || a.pos - b.pos);
+  }
+
+  /**
+   * The newest question AI-DLC asked that no later row answered (approximate: the
+   * engine's own ledger is authoritative, this is for display).
+   */
+  pendingQuestion(rows) {
+    const asking = new Set(['DECISION_RECORDED', 'QUESTION_ASKED', 'STAGE_AWAITING_APPROVAL']);
+    const closing = new Set([
+      'QUESTION_ANSWERED', 'GATE_APPROVED', 'GATE_REJECTED', 'STAGE_COMPLETED', 'STAGE_REVISING',
+      'SUMMARY_CONFIRMATION_RECORDED', 'PLAN_APPROVAL_RECORDED', 'VERIFICATION_COMMAND_RECORDED',
+      'CONSTRUCTION_POLICY_RECORDED', 'STAGE_JUMPED', 'STAGE_SKIPPED'
+    ]);
+    for (let i = rows.length - 1; i >= 0; i--) {
+      const row = rows[i];
+      if (!asking.has(row.event) || !row.fields['Question Id']) continue;
+      const answered = rows.slice(i + 1).some(later =>
+        closing.has(later.event) && (!later.fields.Stage || later.fields.Stage === row.fields.Stage));
+      if (answered) return null;
+      const isGate = row.event === 'STAGE_AWAITING_APPROVAL';
+      return {
+        id: row.fields['Question Id'],
+        type: row.fields['Question Type'] || (isGate ? 'gate' : 'question'),
+        stage: row.fields.Stage || null,
+        text: isGate ? `Phê duyệt stage "${row.fields.Stage}"` : (row.fields.Decision || row.fields.Question || ''),
+        options: isGate
+          ? ['Approve', 'Request Changes']
+          : (row.fields.Options || '').split(/,(?=\s*\S)/).map(s => s.trim()).filter(Boolean),
+        askedAt: row.timestamp
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Every `<stage>-questions.md` in the intent, keyed by stage slug.
+   */
+  allQuestionsFiles(intentPath) {
+    const result = {};
+    const stack = [intentPath];
+    while (stack.length > 0) {
+      const dir = stack.pop();
+      for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+        if (item.name.startsWith('.') || item.name === 'audit') continue;
+        const full = path.join(dir, item.name);
+        const match = item.name.match(/^([a-z0-9-]+)-questions\.md$/);
+        if (item.isDirectory()) stack.push(full);
+        else if (match) result[match[1]] = this.parseQuestionsFile(intentPath, full);
+      }
+    }
+    return result;
+  }
+
+  parseQuestionsFile(intentPath, filePath) {
+    const content = fs.readFileSync(filePath, 'utf-8');
+    const questions = [];
+    let current = null;
+    for (const line of content.split(/\r?\n/)) {
+      const heading = line.match(/^##\s+(Q\d+)\.?\s*(.*)$/);
+      if (heading) {
+        current = { key: heading[1], title: heading[2].trim(), body: [], options: [], answer: '' };
+        questions.push(current);
+        continue;
+      }
+      if (/^##\s/.test(line)) {
+        current = null;
+        continue;
+      }
+      if (!current) continue;
+      const answer = line.match(/^\s*\[Answer\]:\s*(.*)$/);
+      const option = line.match(/^\s*-\s+([A-Z])\.\s+(.*)$/);
+      if (answer) current.answer = answer[1].trim();
+      else if (option) current.options.push({ key: option[1], label: option[2].trim() });
+      else if (line.trim()) current.body.push(line.trim());
+    }
+    return {
+      relPath: path.relative(intentPath, filePath),
+      mtimeMs: fs.statSync(filePath).mtimeMs,
+      questions: questions.map(q => ({ ...q, body: q.body.join(' ') }))
+    };
   }
 
   /**

@@ -6,21 +6,23 @@ Trung tâm điều khiển và trực quan hóa tương tác hai chiều (Two-Wa
 
 ## 🌟 Tính Năng Nổi Bật
 
-### 1. Phân quyền góc nhìn linh hoạt (Dual Persona Views)
+### 1. Hai góc nhìn cho PO và DEV (Dual Persona Views)
 * 👔 **PO View (Dành cho Product Owner / Business):**
   * Theo dõi tiến độ trực quan (% hoàn thành, số lượng tasks).
   * Vòng đời sản phẩm tinh gọn: *Inception* (Khởi tạo & Đặc tả) $\rightarrow$ *Construction* (Lập trình & Test) $\rightarrow$ *Operations* (Bàn giao).
   * **Interactive Approval Gate Card**: Thẻ phê duyệt nổi bật khi Agent chạm trạm dừng, cung cấp nút **`Phê duyệt & Tiếp tục`** và **`Yêu cầu sửa đổi`** kèm form nhập góp ý.
   * Danh sách Features & User Stories, xem trước tài liệu bàn giao (`user-stories.md`, `architecture-design.md`) trực tiếp trên web.
 * 💻 **DEV View (Dành cho Developer / Tech Lead / Architect):**
-  * Toàn bộ ma trận 33 stages của chuẩn AI-DLC.
-  * **Stage Navigator (Jump Stage)**: Click bất kỳ stage nào để điều hướng hoặc ép chuyển bước.
+  * Stage graph thực tế được đọc từ `aidlc-state.md` (hỗ trợ scope rút gọn/custom), với danh sách cố định chỉ là fallback cho dữ liệu cũ.
+  * **Stage Navigator (Jump Stage)**: yêu cầu được chuyển tới `aidlc engine`, không tự sửa state file.
   * Bảng điều khiển Unit of Work (Tasks) tương tác thời gian thực.
   * **Live Audit Trail Console**: Stream log sự kiện từ thư mục `audit/` theo thời gian thực (hỗ trợ lọc theo `INFO`, `DECISION`, `GATE`, `APPROVAL`, `TOOL_CALL`).
   * Trình xem mã nguồn trực tiếp file `aidlc-state.md`.
 
 ### 2. Tự động hóa & Khả năng tương tác thời gian thực (Real-time Live Sync)
 * **File Watcher (`chokidar`)**: Theo dõi thư mục `aidlc/` trong dự án và đồng bộ qua WebSocket tức thời.
+* **Engine-first control**: approve, request changes, next và jump đều gọi AI-DLC engine; dashboard không tự tạo trạng thái giả trong project thật.
+* **Conflict protection**: action gửi kèm phiên bản state đang hiển thị, tránh ghi đè khi agent vừa cập nhật workflow.
 * **Tích hợp sẵn bộ Demo 1-Click**: Tự động sinh dữ liệu mẫu AI-DLC intent (Module thanh toán Checkout) và nút **`Simulate Step`** để mô phỏng từng bước hành vi của Agent.
 
 ---
@@ -56,6 +58,11 @@ Tùy chọn:
 * `-w, --workspace <path>`: Chỉ định thư mục dự án cần theo dõi.
 * `--no-open`: Không tự động bật trình duyệt.
 * `--demo`: Tự động tạo thư mục AI-DLC mẫu nếu chưa có.
+
+Khi chạy project thật, hãy bảo đảm đã cài `aidlc` và chạy `aidlc config` trong
+workspace. Chế độ mặc định là `ENGINE MODE`: dashboard chỉ điều khiển qua
+`aidlc engine` và không sửa trực tiếp `aidlc-state.md`. Cờ `--demo` mới bật
+`DEMO FILE MODE`, chỉ dành cho dữ liệu mô phỏng.
 
 ---
 

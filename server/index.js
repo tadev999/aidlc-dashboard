@@ -3,8 +3,8 @@ const http = require('http');
 const WebSocket = require('ws');
 const path = require('path');
 const fs = require('fs');
-const cors = require('cors');
-const { exec } = require('child_process');
+const crypto = require('crypto');
+const { exec, spawnSync } = require('child_process');
 
 function openBrowser(url) {
   const start = process.platform === 'darwin' ? 'open' : process.platform === 'win32' ? 'start' : 'xdg-open';
@@ -17,25 +17,55 @@ const { AidlcParser, AIDLC_PHASES } = require('./aidlcParser');
 const { AidlcController } = require('./controller');
 const { AidlcWatcher } = require('./watcher');
 const { createSampleAidlcStructure } = require('./mockDataGenerator');
+const { AgentRelay } = require('./agentRelay');
+
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+function isLocalHost(value) {
+  if (!value) return false;
+  try {
+    return LOCAL_HOSTNAMES.has(new URL(value.includes('://') ? value : `http://${value}`).hostname);
+  } catch {
+    return false;
+  }
+}
 
 function createServer(options = {}) {
   let workspaceRoot = path.resolve(options.workspaceRoot || process.cwd());
   const app = express();
   const server = http.createServer(app);
-  const wss = new WebSocket.Server({ server, path: '/ws' });
+  // Signing power lives behind this API, so only this machine's own pages may reach it.
+  const sessionToken = crypto.randomBytes(32).toString('hex');
+  const wss = new WebSocket.Server({
+    server,
+    path: '/ws',
+    verifyClient: ({ req }) => isLocalHost(req.headers.host) && (!req.headers.origin || isLocalHost(req.headers.origin))
+  });
 
-  app.use(cors());
+  app.use((req, res, next) => {
+    if (!isLocalHost(req.headers.host)) return res.status(403).json({ error: 'Host not allowed' });
+    if (req.headers.origin && !isLocalHost(req.headers.origin)) return res.status(403).json({ error: 'Origin not allowed' });
+    if (req.method !== 'GET' && req.path.startsWith('/api')) {
+      const sent = Buffer.from(String(req.headers['x-aidlc-dashboard-token'] || ''));
+      const expected = Buffer.from(sessionToken);
+      if (sent.length !== expected.length || !crypto.timingSafeEqual(sent, expected)) {
+        return res.status(403).json({ error: 'Missing or invalid dashboard session token' });
+      }
+    }
+    next();
+  });
   app.use(express.json());
+
+  app.get('/api/session', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({ token: sessionToken });
+  });
 
   let parser = new AidlcParser(workspaceRoot);
   let controller = new AidlcController(workspaceRoot);
   let selectedIntentId = null;
 
-  const recentWorkspaces = new Set([
-    workspaceRoot,
-    '/Users/taduongngoc/Projects/an_match',
-    '/Users/taduongngoc/Projects/aidlc-dashboard'
-  ]);
+  const recentWorkspaces = new Set([workspaceRoot]);
 
   // Broadcast to all WebSocket clients
   function broadcast(data) {
@@ -45,6 +75,22 @@ function createServer(options = {}) {
         client.send(payload);
       }
     });
+  }
+
+  const relay = new AgentRelay({ broadcast });
+  relay.onDone = () => broadcast({ type: 'STATE_UPDATE', payload: getSnapshot() });
+
+  // The chat the person last spoke in for this intent, as AI-DLC's prompt hook recorded it.
+  function agentSessionId(intent) {
+    if (!intent) return null;
+    const turns = parser.parseEngineAudit(intent.path).filter(row => row.event === 'HUMAN_TURN' && row.fields.Session);
+    const session = turns.length > 0 ? turns[turns.length - 1].fields.Session : null;
+    return session && /^[0-9a-f-]{36}$/i.test(session) ? session : null;
+  }
+
+  function relayToAgent(text) {
+    const intent = getSnapshot().currentIntent;
+    return relay.send(workspaceRoot, text, agentSessionId(intent));
   }
 
   // Get current snapshot data
@@ -64,13 +110,37 @@ function createServer(options = {}) {
     let state = null;
     let auditLogs = [];
     let artifacts = [];
+    let pendingQuestion = null;
+    let questionsFile = null;
+    let questionFiles = {};
 
     if (currentIntent) {
       const statePath = path.join(currentIntent.path, 'aidlc-state.md');
       state = parser.parseStateFile(statePath);
       auditLogs = parser.parseAuditLogs(currentIntent.path);
       artifacts = parser.getArtifacts(currentIntent.path);
+      try {
+        pendingQuestion = parser.pendingQuestion(parser.parseEngineAudit(currentIntent.path));
+        questionFiles = parser.allQuestionsFiles(currentIntent.path);
+        questionsFile = questionFiles[pendingQuestion?.stage || state?.stage] || null;
+      } catch (err) {
+        console.error('Error reading questions:', err);
+      }
     }
+
+    let approver = null;
+    if (!controller.fileMode && currentIntent) {
+      try {
+        approver = controller.approverStatus();
+      } catch (err) {
+        approver = { error: err.message };
+      }
+    }
+    const activeIntent = Boolean(approver?.intentDir && currentIntent &&
+      fs.realpathSync(approver.intentDir) === fs.realpathSync(currentIntent.path));
+    const canDecide = controller.fileMode
+      ? Boolean(currentIntent)
+      : Boolean(approver?.gate && activeIntent && (agentSessionId(currentIntent) || approver?.enrolled));
 
     return {
       workspaceRoot,
@@ -80,7 +150,28 @@ function createServer(options = {}) {
       state,
       auditLogs,
       artifacts,
-      phases: AIDLC_PHASES,
+      pendingQuestion,
+      questionsFile,
+      questionFiles,
+      agent: controller.fileMode ? null : relay.status(),
+      // Prefer the compiled graph recorded by AI-DLC. The stock list is only
+      // a fallback for legacy/demo state files.
+      phases: state?.stageGraph || AIDLC_PHASES,
+      approver: approver && {
+        enrolled: Boolean(approver.enrolled),
+        name: approver.name || null,
+        gate: approver.gate || null,
+        activeIntent,
+        error: approver.error || approver.keyError || null
+      },
+      capabilities: {
+        controlMode: controller.fileMode ? 'demo-file' : 'aidlc-engine',
+        canApprove: canDecide,
+        canRequestChanges: canDecide,
+        canJumpStage: Boolean(currentIntent),
+        canEditTasks: controller.fileMode,
+        canSimulate: controller.fileMode
+      },
       recentWorkspaces: Array.from(recentWorkspaces),
       timestamp: new Date().toISOString()
     };
@@ -136,13 +227,14 @@ function createServer(options = {}) {
       }
 
       const resolved = path.resolve(newPath.trim());
-      if (!fs.existsSync(resolved)) {
+      if (!fs.existsSync(resolved) || !fs.statSync(resolved).isDirectory()) {
         return res.status(404).json({ error: `Thư mục không tồn tại trên máy: ${resolved}` });
       }
 
       workspaceRoot = resolved;
       parser = new AidlcParser(workspaceRoot);
       controller = new AidlcController(workspaceRoot);
+      relay.sessionId = null;
       selectedIntentId = null;
       recentWorkspaces.add(workspaceRoot);
 
@@ -179,16 +271,18 @@ function createServer(options = {}) {
         ? label.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '')
         : description.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').slice(0, 20).replace(/^-|-$/g, '') || 'new-task';
 
-      const { execSync } = require('child_process');
-      const cmd = `export PATH="$HOME/.local/bin:$PATH" && cd "${workspaceRoot}" && aidlc engine intent create --scope "${scope}" --arguments "${description.replace(/"/g, '\\"')}" --label "${cleanLabel}"`;
-
-      let output = '';
-      try {
-        output = execSync(cmd, { encoding: 'utf-8', shell: '/bin/zsh' });
-      } catch (err) {
-        console.warn('CLI intent create note:', err.message);
-        output = err.stdout || err.message;
+      if (!/^[a-z0-9-]+$/i.test(scope)) {
+        return res.status(400).json({ error: 'Scope không hợp lệ' });
       }
+      const result = spawnSync('aidlc', [
+        'engine', 'intent', 'create', '--scope', scope,
+        '--arguments', description.trim(), '--label', cleanLabel
+      ], { cwd: workspaceRoot, encoding: 'utf8', timeout: 120000, windowsHide: true });
+      if (result.error || result.status !== 0) {
+        const detail = result.error?.message || result.stderr || result.stdout || 'unknown error';
+        return res.status(500).json({ error: `Không tạo được intent qua AI-DLC engine: ${detail}` });
+      }
+      const output = (result.stdout || '').trim();
 
       const updatedSnapshot = getSnapshot();
       if (updatedSnapshot.intents.length > 0) {
@@ -212,8 +306,9 @@ function createServer(options = {}) {
       return res.status(404).json({ error: 'No active intent' });
     }
 
-    const safePath = path.join(current.path, path.normalize(relPath));
-    if (!safePath.startsWith(current.path) || !fs.existsSync(safePath)) {
+    const safePath = path.resolve(current.path, relPath || '');
+    const intentRoot = path.resolve(current.path) + path.sep;
+    if (!safePath.startsWith(intentRoot) || !fs.existsSync(safePath) || !fs.statSync(safePath).isFile()) {
       return res.status(404).json({ error: 'Artifact not found' });
     }
 
@@ -225,16 +320,74 @@ function createServer(options = {}) {
     }
   });
 
+  // Fill `[Answer]:` lines of the stage's questions file: the person's own file edit, as in "I'll edit the file".
+  app.post('/api/questions/answer', (req, res) => {
+    try {
+      const { relPath, answers, expectedMtimeMs } = req.body || {};
+      const current = getSnapshot().currentIntent;
+      if (!current) return res.status(400).json({ error: 'No active intent found' });
+      if (typeof relPath !== 'string' || !relPath.endsWith('-questions.md')) {
+        return res.status(400).json({ error: 'Chỉ được ghi vào file *-questions.md' });
+      }
+      const intentRoot = path.resolve(current.path) + path.sep;
+      const target = path.resolve(current.path, relPath);
+      if (!target.startsWith(intentRoot) || !fs.existsSync(target) || fs.lstatSync(target).isSymbolicLink()) {
+        return res.status(404).json({ error: 'Questions file not found' });
+      }
+      if (expectedMtimeMs != null && Math.abs(fs.statSync(target).mtimeMs - Number(expectedMtimeMs)) > 0.5) {
+        return res.status(409).json({ error: 'File câu hỏi vừa được agent thay đổi. Tải lại rồi điền lại.' });
+      }
+      if (!answers || typeof answers !== 'object') return res.status(400).json({ error: 'answers required' });
+
+      const lines = fs.readFileSync(target, 'utf-8').split('\n');
+      let section = null;
+      const written = [];
+      for (let i = 0; i < lines.length; i++) {
+        const heading = lines[i].match(/^##\s+(Q\d+)\b/);
+        if (heading) { section = heading[1]; continue; }
+        if (/^##\s/.test(lines[i])) { section = null; continue; }
+        if (!section || !Object.hasOwn(answers, section) || !/^\s*\[Answer\]:/.test(lines[i])) continue;
+        const text = String(answers[section]).replace(/\s+/g, ' ').trim().slice(0, 4000);
+        lines[i] = text ? `[Answer]: ${text}` : '[Answer]:';
+        written.push(section);
+        section = null;
+      }
+      fs.writeFileSync(target, lines.join('\n'), 'utf-8');
+
+      const snapshot = getSnapshot();
+      broadcast({ type: 'STATE_UPDATE', payload: snapshot });
+      res.json({ success: true, written, relPath });
+    } catch (err) {
+      res.status(500).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/agent/send', (req, res) => {
+    try {
+      if (controller.fileMode) return res.status(400).json({ error: 'Demo mode không có agent thật' });
+      res.json({ success: true, ...relayToAgent(req.body?.text) });
+    } catch (err) {
+      res.status(409).json({ error: err.message });
+    }
+  });
+
+  app.post('/api/agent/stop', (req, res) => {
+    relay.stop();
+    res.json({ success: true });
+  });
+
   // Action: Approve Gate
   app.post('/api/action/approve', (req, res) => {
     try {
-      const { feedback } = req.body;
+      const { feedback, expectedMtimeMs } = req.body;
       const snapshot = getSnapshot();
       if (!snapshot.currentIntent) {
         return res.status(400).json({ error: 'No active intent found' });
       }
 
-      const result = controller.approveGate(snapshot.currentIntent.path, feedback);
+      const result = controller.fileMode || !agentSessionId(snapshot.currentIntent)
+        ? controller.approveGate(snapshot.currentIntent.path, feedback, expectedMtimeMs)
+        : { success: true, relayed: true, ...relayToAgent(feedback ? `Approve\n\nGhi chú: ${feedback}` : 'Approve') };
       const updatedSnapshot = getSnapshot();
       broadcast({ type: 'STATE_UPDATE', payload: updatedSnapshot });
       res.json(result);
@@ -246,7 +399,7 @@ function createServer(options = {}) {
   // Action: Request Changes (Feedback)
   app.post('/api/action/request-changes', (req, res) => {
     try {
-      const { comments } = req.body;
+      const { comments, expectedMtimeMs } = req.body;
       if (!comments) {
         return res.status(400).json({ error: 'Comments required' });
       }
@@ -256,7 +409,9 @@ function createServer(options = {}) {
         return res.status(400).json({ error: 'No active intent found' });
       }
 
-      const result = controller.requestChanges(snapshot.currentIntent.path, comments);
+      const result = controller.fileMode || !agentSessionId(snapshot.currentIntent)
+        ? controller.requestChanges(snapshot.currentIntent.path, comments, expectedMtimeMs)
+        : { success: true, relayed: true, ...relayToAgent(`Request Changes: ${comments}`) };
       const updatedSnapshot = getSnapshot();
       broadcast({ type: 'STATE_UPDATE', payload: updatedSnapshot });
       res.json(result);
@@ -291,7 +446,7 @@ function createServer(options = {}) {
         return res.status(400).json({ error: 'No active intent found' });
       }
 
-      const result = controller.jumpStage(snapshot.currentIntent.path, stage, phase);
+      const result = controller.jumpStage(snapshot.currentIntent.path, stage, phase, req.body.expectedMtimeMs);
       const updatedSnapshot = getSnapshot();
       broadcast({ type: 'STATE_UPDATE', payload: updatedSnapshot });
       res.json(result);
@@ -375,7 +530,7 @@ function createServer(options = {}) {
 function startServer(port = 3300, workspaceRoot = process.cwd(), autoOpen = false) {
   const { server } = createServer({ workspaceRoot });
 
-  server.listen(port, () => {
+  server.listen(port, '127.0.0.1', () => {
     const url = `http://localhost:${port}`;
     console.log(`\n======================================================`);
     console.log(`🚀 AI-DLC Interactive Dashboard is running!`);

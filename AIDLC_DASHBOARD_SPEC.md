@@ -53,6 +53,11 @@ Ghi log tuần tự từng sự kiện:
 
 ## 3. Kiến Trúc Kỹ Thuật Interactive Dashboard
 
+Trong project thật, AI-DLC engine là nguồn quyền lực duy nhất đối với
+lifecycle. Dashboard chỉ đọc state/audit và gửi command qua `aidlc engine`; nó
+không tự ghi đè `aidlc-state.md`. Cơ chế sửa file trực tiếp chỉ dành cho
+`--demo`.
+
 Hệ thống hoạt động theo mô hình **hai chiều (Two-Way Control Plane)**: vừa cập nhật tiến độ theo thời gian thực (Read/Observe), vừa cho phép người dùng ra lệnh điều khiển (Control/Write).
 
 ```mermaid
@@ -67,7 +72,7 @@ flowchart TD
     subgraph Backend["Dashboard Server (Node.js / Express + WebSocket)"]
         B1["File Watcher (chokidar)<br/>Quan sát aidlc-state.md & audit/"]
         B2["State Parser<br/>Chuyển Markdown/YAML sang JSON"]
-        B3["Process Controller / PTY Manager<br/>(node-pty / IPC)"]
+        B3["AI-DLC Engine Adapter<br/>(aidlc engine, no direct state writes)"]
         B4["WebSocket Gateway (Socket.io / ws)"]
     end
 
@@ -113,15 +118,17 @@ flowchart TD
 
 ## 5. Cơ Chế Điều Khiển Kỹ Thuật (Control Mechanism)
 
-Để Dashboard có thể gửi lệnh vào Agent, sử dụng một trong 2 giải pháp:
+Trong project thật, Dashboard gửi lifecycle action tới AI-DLC engine. PTY chỉ
+là phần mở rộng để quản lý session agent, không phải cách dashboard tự xác
+nhận gate.
 
-### Giải pháp 1: Quản lý qua Pseudo-Terminal (PTY) *(Khuyên dùng)*
+### Giải pháp mở rộng: Quản lý qua Pseudo-Terminal (PTY)
 * Backend Dashboard khởi tạo tiến trình Agent bằng thư viện `node-pty`.
 * Toàn bộ stdout/stderr được truyền qua WebSocket về terminal trên web.
 * Khi người dùng bấm nút **Approve** hay nhập **Feedback**, Backend ghi input thẳng vào stdin của tiến trình PTY (`ptyProcess.write("Approve\n")`).
 * **Ưu điểm:** Tương thích 100% với mọi CLI (Claude, Antigravity CLI, Cursor CLI) mà không cần can thiệp source code của `aidlc-workflows`.
 
-### Giải pháp 2: File-based Signal & Directives
+### Giải pháp demo: File-based Signal & Directives
 * Dashboard ghi trực tiếp file chỉ thị điều khiển hoặc cập nhật cờ trong thư mục intent.
 * Hook của `aidlc` đọc tín hiệu từ file này để ra quyết định chuyển bước.
 * **Ưu điểm:** Nhẹ nhàng, không phụ thuộc vào trạng thái terminal active.

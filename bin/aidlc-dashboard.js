@@ -25,6 +25,9 @@ const autoOpen = options.open !== false;
 if (options.demo) {
   console.log('Generating demo AI-DLC intent structure...');
   createSampleAidlcStructure(workspaceRoot);
+  // Demo data is intentionally file-backed. Production workspaces use the
+  // real `aidlc engine` control path by default.
+  process.env.AIDLC_DASHBOARD_FILE_MODE = '1';
 }
 
 startServer(port, workspaceRoot, autoOpen);

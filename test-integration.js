@@ -1,4 +1,6 @@
 const http = require('http');
+// This test exercises the bundled mock workflow, not a real AI-DLC project.
+process.env.AIDLC_DASHBOARD_FILE_MODE = '1';
 const { createServer } = require('./server/index');
 
 async function testAll() {
@@ -9,14 +11,17 @@ async function testAll() {
   await new Promise(resolve => server.listen(port, resolve));
   console.log(`Test server running on port ${port}`);
 
+  let token = '';
   const request = (path, method = 'GET', body = null) => {
     return new Promise((resolve, reject) => {
+      const headers = body ? { 'Content-Type': 'application/json' } : {};
+      if (method !== 'GET') headers['X-AIDLC-Dashboard-Token'] = token;
       const req = http.request({
         hostname: 'localhost',
         port,
         path,
         method,
-        headers: body ? { 'Content-Type': 'application/json' } : {}
+        headers
       }, (res) => {
         let data = '';
         res.on('data', chunk => data += chunk);
@@ -33,6 +38,11 @@ async function testAll() {
       req.end();
     });
   };
+
+  // 0. Mutating requests need the session token; without it they are refused
+  const res0 = await request('/api/demo/create', 'POST', {});
+  if (res0.status !== 403) throw new Error(`expected 403 without token, got ${res0.status}`);
+  token = (await request('/api/session')).body.token;
 
   // 1. Initial status
   let res = await request('/api/status');
